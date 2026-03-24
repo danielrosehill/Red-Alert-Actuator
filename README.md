@@ -9,7 +9,7 @@ Consumes real-time alert data from the [Oref Alert Proxy](https://github.com/dan
 - **Smart lights via MQTT** — Color changes based on alert state (red = active threat, orange = pre-warning, green = all clear, off after timeout)
 - **Snapcast TTS** — Pre-recorded voice announcements played through your whole-house audio system
 
-This is part of the [Red Alert Stack](https://github.com/danielrosehill/Red-Alert-Stack) microservices architecture.
+This is part of the [Red Alert Monitoring Stack](https://github.com/danielrosehill/Red-Alert-Monitoring-Stack-Public) microservices architecture.
 
 ```
 ┌─────────────────────┐
