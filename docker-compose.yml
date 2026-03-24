@@ -1,0 +1,11 @@
+services:
+  actuator:
+    build: .
+    container_name: red-alert-actuator
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Mount the Snapcast FIFO from the host
+      - /tmp/snapfifo:/tmp/snapfifo
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
