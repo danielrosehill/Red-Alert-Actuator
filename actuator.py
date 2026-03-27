@@ -48,13 +48,20 @@ MQTT_LIGHT_TOPICS = [
     for t in os.environ.get("MQTT_LIGHT_TOPICS", "").split(",")
     if t.strip()
 ]
+MQTT_SIREN_TOPICS = [
+    t.strip()
+    for t in os.environ.get("MQTT_SIREN_TOPICS", "").split(",")
+    if t.strip()
+]
 LIGHT_RESTORE_AFTER = int(os.environ.get("LIGHT_RESTORE_AFTER", "120"))
+LIGHT_FLASH_DURATION = int(os.environ.get("LIGHT_FLASH_DURATION", "10"))
+LIGHT_FLASH_INTERVAL = float(os.environ.get("LIGHT_FLASH_INTERVAL", "0.5"))
 
 SNAPCAST_FIFO = os.environ.get("SNAPCAST_FIFO", "/tmp/snapfifo")
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").lower() in ("true", "1", "yes")
 TTS_COOLDOWN = int(os.environ.get("TTS_COOLDOWN", "60"))
 
-LOCAL_AREA = os.environ.get("LOCAL_AREA", "ירושלים - דרום")
+LOCAL_AREA = os.environ.get("ALERT_AREA", os.environ.get("LOCAL_AREA", "ירושלים - דרום"))
 
 AUDIO_DIR = Path(__file__).parent / "audio"
 
@@ -74,16 +81,17 @@ COLORS = {
 # ── MQTT Client ──────────────────────────────────────────────────────────────
 
 
-class LightController:
+class MQTTController:
     def __init__(self):
         self.client: mqtt.Client | None = None
         self.current_color: str = ""
+        self._flash_task: asyncio.Task | None = None
 
         if not HAS_MQTT:
-            log.warning("paho-mqtt not installed — light control disabled")
+            log.warning("paho-mqtt not installed — MQTT control disabled")
             return
-        if not MQTT_LIGHT_TOPICS:
-            log.info("No MQTT_LIGHT_TOPICS configured — light control disabled")
+        if not MQTT_LIGHT_TOPICS and not MQTT_SIREN_TOPICS:
+            log.info("No MQTT topics configured — MQTT control disabled")
             return
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -93,28 +101,81 @@ class LightController:
             self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
             self.client.loop_start()
             log.info(
-                "MQTT connected to %s:%d (%d lights)",
+                "MQTT connected to %s:%d (%d lights, %d sirens)",
                 MQTT_BROKER,
                 MQTT_PORT,
                 len(MQTT_LIGHT_TOPICS),
+                len(MQTT_SIREN_TOPICS),
             )
         except Exception as e:
             log.error("MQTT connection failed: %s", e)
             self.client = None
 
-    def set_color(self, color: str):
-        """Set all lights to a color. color is one of: red, orange, green, off."""
-        if not self.client or color == self.current_color:
+    def _publish(self, topics: list[str], payload: str):
+        if not self.client:
             return
-
-        payload = json.dumps(COLORS.get(color, COLORS["off"]))
-        for topic in MQTT_LIGHT_TOPICS:
+        for topic in topics:
             self.client.publish(topic, payload)
 
+    def set_color(self, color: str, flash: bool = False):
+        """Set all lights to a color. If flash=True, flash for LIGHT_FLASH_DURATION
+        seconds then stay solid."""
+        if not self.client:
+            return
+
+        # Cancel any running flash
+        if self._flash_task and not self._flash_task.done():
+            self._flash_task.cancel()
+
+        if flash and color in ("red", "orange"):
+            self._flash_task = asyncio.ensure_future(self._flash_then_solid(color))
+        else:
+            self._set_lights(color)
+
+    def _set_lights(self, color: str):
+        payload = json.dumps(COLORS.get(color, COLORS["off"]))
+        self._publish(MQTT_LIGHT_TOPICS, payload)
         log.info("Lights → %s (%d lights)", color, len(MQTT_LIGHT_TOPICS))
         self.current_color = color
 
+    async def _flash_then_solid(self, color: str):
+        """Flash lights on/off for LIGHT_FLASH_DURATION seconds, then stay solid."""
+        end_time = time.time() + LIGHT_FLASH_DURATION
+        on_payload = json.dumps(COLORS[color])
+        off_payload = json.dumps(COLORS["off"])
+
+        log.info("Lights flashing %s for %ds", color, LIGHT_FLASH_DURATION)
+        try:
+            while time.time() < end_time:
+                self._publish(MQTT_LIGHT_TOPICS, on_payload)
+                await asyncio.sleep(LIGHT_FLASH_INTERVAL)
+                self._publish(MQTT_LIGHT_TOPICS, off_payload)
+                await asyncio.sleep(LIGHT_FLASH_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+        # Stay solid in the alert color
+        self._set_lights(color)
+
+    def sirens_on(self):
+        """Activate all sirens."""
+        if not self.client or not MQTT_SIREN_TOPICS:
+            return
+        payload = json.dumps({"alarm": "burglar"})
+        self._publish(MQTT_SIREN_TOPICS, payload)
+        log.info("Sirens ON (%d sirens)", len(MQTT_SIREN_TOPICS))
+
+    def sirens_off(self):
+        """Deactivate all sirens."""
+        if not self.client or not MQTT_SIREN_TOPICS:
+            return
+        payload = json.dumps({"alarm": "stop"})
+        self._publish(MQTT_SIREN_TOPICS, payload)
+        log.info("Sirens OFF")
+
     def close(self):
+        if self._flash_task and not self._flash_task.done():
+            self._flash_task.cancel()
         if self.client:
             self.client.loop_stop()
             self.client.disconnect()
@@ -173,10 +234,10 @@ class TTSPlayer:
 
 class AlertMonitor:
     def __init__(
-        self, http_client: httpx.AsyncClient, lights: LightController, tts: TTSPlayer
+        self, http_client: httpx.AsyncClient, mqtt_ctl: MQTTController, tts: TTSPlayer
     ):
         self.http_client = http_client
-        self.lights = lights
+        self.mqtt = mqtt_ctl
         self.tts = tts
 
         # State tracking
@@ -236,12 +297,14 @@ class AlertMonitor:
 
         if local_state != self.prev_local_state:
             if local_state == "active":
-                self.lights.set_color("red")
+                self.mqtt.set_color("red", flash=True)
+                self.mqtt.sirens_on()
                 self.tts.play("red_alert")
                 self.last_active_time = time.time()
                 self.all_clear_sent = False
             elif local_state == "warning":
-                self.lights.set_color("orange")
+                self.mqtt.set_color("orange", flash=True)
+                self.mqtt.sirens_on()
                 self.tts.play("early_warning")
                 self.last_active_time = time.time()
                 self.all_clear_sent = False
@@ -249,7 +312,8 @@ class AlertMonitor:
                 "active",
                 "warning",
             ):
-                self.lights.set_color("green")
+                self.mqtt.set_color("green")
+                self.mqtt.sirens_off()
                 self.tts.play("all_clear")
                 self.all_clear_sent = True
             elif local_state == "" and self.prev_local_state:
@@ -258,7 +322,8 @@ class AlertMonitor:
                     "active",
                     "warning",
                 ):
-                    self.lights.set_color("green")
+                    self.mqtt.set_color("green")
+                    self.mqtt.sirens_off()
                     self.tts.play("all_clear")
                     self.all_clear_sent = True
 
@@ -277,7 +342,7 @@ class AlertMonitor:
             self.tts.play(audio_name)
             # If no local alert is active, flash red for nationwide threshold
             if not local_state or local_state == "clear":
-                self.lights.set_color("red")
+                self.mqtt.set_color("red", flash=True)
                 self.last_active_time = time.time()
                 self.all_clear_sent = False
 
@@ -289,12 +354,12 @@ class AlertMonitor:
             return
         if not self.last_active_time:
             return
-        if self.lights.current_color == "off" or self.lights.current_color == "":
+        if self.mqtt.current_color == "off" or self.mqtt.current_color == "":
             return
 
         elapsed = time.time() - self.last_active_time
         if elapsed > LIGHT_RESTORE_AFTER:
-            self.lights.set_color("off")
+            self.mqtt.set_color("off")
             self.last_active_time = 0
 
 
@@ -302,17 +367,17 @@ class AlertMonitor:
 
 
 async def main():
-    lights = LightController()
+    mqtt_ctl = MQTTController()
     tts = TTSPlayer()
 
     log.info("Red Alert Actuator starting...")
     log.info("Proxy: %s", OREF_PROXY_URL)
-    log.info("Local area: %s", LOCAL_AREA)
-    log.info("MQTT lights: %d topics", len(MQTT_LIGHT_TOPICS))
+    log.info("Alert area: %s", LOCAL_AREA)
+    log.info("MQTT lights: %d topics, sirens: %d topics", len(MQTT_LIGHT_TOPICS), len(MQTT_SIREN_TOPICS))
     log.info("TTS: %s (cooldown: %ds)", "enabled" if TTS_ENABLED else "disabled", TTS_COOLDOWN)
 
     async with httpx.AsyncClient() as http_client:
-        monitor = AlertMonitor(http_client, lights, tts)
+        monitor = AlertMonitor(http_client, mqtt_ctl, tts)
 
         try:
             while True:
@@ -321,7 +386,7 @@ async def main():
         except asyncio.CancelledError:
             pass
         finally:
-            lights.close()
+            mqtt_ctl.close()
 
 
 if __name__ == "__main__":
